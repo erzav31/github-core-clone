@@ -1,3 +1,9 @@
+[![make.fun](https://make.fun/badge/github-core-clone-01.svg)](https://make.fun/bounty/github-core-clone-01)
+[![rank](https://make.fun/badge/github-core-clone-01/erzav31/github-core-clone/rank.svg)](https://make.fun/bounty/github-core-clone-01)
+[![reward](https://make.fun/badge/github-core-clone-01/erzav31/github-core-clone/reward.svg)](https://make.fun/bounty/github-core-clone-01)
+
+Built for the [make.fun bounty: Build a GitHub-compatible git forge](https://make.fun/bounty/github-core-clone-01).
+
 # forge — a standalone, GitHub-compatible git forge in one process
 
 One Node 22 process, standard library only, serving from its own in-memory
