@@ -269,30 +269,54 @@ function writePack(objects) {
   return Buffer.concat([body, createHash('sha1').update(body).digest()]);
 }
 
+/** Adler-32 checksum (RFC 1950), pure JS: the last 4 bytes of a zlib stream
+ *  hold it big-endian, so it locates a stream's end without trial inflates. */
+function adler32(buf) {
+  const MOD = 65521;
+  let a = 1;
+  let b = 0;
+  let off = 0;
+  while (off < buf.length) {
+    const end = Math.min(off + 5552, buf.length);
+    for (; off < end; off++) {
+      a += buf[off];
+      b += a;
+    }
+    a %= MOD;
+    b %= MOD;
+  }
+  return ((b << 16) | a) >>> 0;
+}
+
 /** Inflate one zlib stream starting at `offset`; returns {data, next} where
  *  next is the offset just past the stream. inflateSync ignores trailing
- *  bytes, so the end is found by binary search for the shortest prefix that
- *  inflates cleanly (a truncated stream always throws). */
+ *  bytes, so one inflate of the remainder yields the data; the stream's end
+ *  is then found by scanning for its trailing Adler-32 (a native memmem
+ *  search), and the candidate slice is verified by re-inflating exactly it —
+ *  so a chance Adler match inside the deflate data can never misplace the
+ *  boundary. No trial-and-error inflates, no throws in the common path. */
 function inflateAt(buf, offset, end) {
-  let lo = offset;
-  let hi = end;
-  let best = null;
-  while (lo < hi) {
-    const mid = (lo + hi) >> 1;
+  const data = inflateSync(buf.subarray(offset, end));
+  const needle = Buffer.alloc(4);
+  needle.writeUInt32BE(adler32(data), 0);
+  // Scan every Adler candidate in turn; a candidate only counts when the
+  // exact slice re-inflates to the same data, so a chance match inside the
+  // deflate bytes can never misplace the boundary.
+  let scanFrom = offset + 2;
+  for (;;) {
+    const at = buf.subarray(scanFrom, end).indexOf(needle);
+    if (at < 0) break;
+    const next = scanFrom + at + 4;
     try {
-      const data = inflateSync(buf.subarray(offset, mid));
-      best = { data, next: mid };
-      hi = mid;
+      const check = inflateSync(buf.subarray(offset, next));
+      if (check.length === data.length) return { data, next };
     } catch {
-      lo = mid + 1;
+      // Truncated slice: the Adler bytes occurred inside the deflate data.
+      // Keep scanning for the next candidate.
     }
+    scanFrom = next;
   }
-  if (best === null) {
-    // The whole remainder inflates: the stream runs to `end`.
-    const data = inflateSync(buf.subarray(offset, end));
-    return { data, next: end };
-  }
-  return best;
+  return { data, next: end };
 }
 
 function readPack(pack) {
@@ -930,6 +954,7 @@ function v0FetchResponse(repo, body) {
 
 function receivePackResponse(repo, body) {
   const { packets, rest } = decodePktLines(body);
+  if (packets.length === 0) return null; // malformed: no pkt-lines at all
   const commands = [];
   for (const packet of packets) {
     if (packet.kind !== 'data') continue;
@@ -1034,9 +1059,9 @@ async function gitHandler(req, res, owner, repoName, tail, body) {
   if (tail === 'git-receive-pack') {
     if (!repo) return sendJson(res, 404, { message: 'Not Found' });
     if (body.length === 0) return sendJson(res, 400, { message: 'empty receive-pack body' });
-    const { packets } = decodePktLines(body);
-    if (packets.length === 0) return sendJson(res, 400, { message: 'malformed receive-pack body' });
-    return sendBinary(200, 'application/x-git-receive-pack-result', receivePackResponse(repo, body));
+    const buf = receivePackResponse(repo, body);
+    if (buf === null) return sendJson(res, 400, { message: 'malformed receive-pack body' });
+    return sendBinary(200, 'application/x-git-receive-pack-result', buf);
   }
   return sendJson(res, 404, { message: 'Not Found' });
 }
@@ -1044,16 +1069,42 @@ async function gitHandler(req, res, owner, repoName, tail, body) {
 // ---------------------------------------------------------------------------
 // HTTP plumbing shared by the REST, GraphQL and MCP handlers
 
-function sendJson(res, status, obj, extraHeaders = {}) {
-  const body = status === 204 ? '' : JSON.stringify(obj);
+function sendJsonBody(res, status, body, extraHeaders = {}) {
+  const buf = typeof body === 'string' ? Buffer.from(body, 'utf8') : body;
   res.writeHead(status, {
     'Content-Type': 'application/json',
-    'Content-Length': Buffer.byteLength(body),
+    'Content-Length': buf.length,
     'X-GitHub-Request-Id': requestId(),
     'X-OAuth-Scopes': 'repo, user',
     ...extraHeaders,
   });
-  res.end(body);
+  res.end(buf);
+}
+
+function sendJson(res, status, obj, extraHeaders = {}) {
+  sendJsonBody(res, status, status === 204 ? '' : JSON.stringify(obj), extraHeaders);
+}
+
+// Cache key for a serialized single-issue body: invisible to any JSON
+// serialization of the issue itself (Symbol, never enumerated).
+const ISSUE_JSON_CACHE = Symbol('cachedIssueJson');
+
+/** Serialized GET-single-issue body, cached per host: the read workload asks
+ *  for the same issue thousands of times while it never changes. Any handler
+ *  that mutates the issue (PATCH, comment POST) or its labels must delete the
+ *  entry first. */
+function issueJsonBody(repo, issue, host) {
+  const cached = issue[ISSUE_JSON_CACHE];
+  if (cached && cached.host === host) return cached.body;
+  const body = JSON.stringify(issueJson(repo, issue, host));
+  issue[ISSUE_JSON_CACHE] = { host, body };
+  return body;
+}
+
+/** Drop every cached issue body of a repo (a rename changes the URLs
+ *  embedded in them; nothing else in the repo record does). */
+function clearIssueJsonCache(repo) {
+  for (const issue of repo.issues) delete issue[ISSUE_JSON_CACHE];
 }
 
 function readBody(req) {
@@ -1102,6 +1153,11 @@ function userJson(login = VIEWER_LOGIN) {
     email: login === VIEWER_LOGIN ? VIEWER_EMAIL : `${login}@example.invalid`,
   };
 }
+
+// The viewer user object never changes: share one instance instead of
+// rebuilding it (with its base64 node id) for every issue/repo rendered.
+// It is only ever JSON-stringified, never mutated.
+const VIEWER_USER_JSON = userJson(VIEWER_LOGIN);
 
 function repoJson(repo, host) {
   const openIssues = repo.issues.filter((i) => i.state === 'open').length;
@@ -1174,7 +1230,7 @@ function issueJson(repo, issue, host) {
     number: issue.number,
     title: issue.title,
     body: issue.body,
-    user: userJson(VIEWER_LOGIN),
+    user: VIEWER_USER_JSON,
     labels: issue.labels.map((name) => labelJson(repo.labels.get(name))),
     state: issue.state,
     locked: false,
@@ -1558,6 +1614,7 @@ async function restHandler(req, res, body) {
           repo.name = payload.name;
           repo.fullName = `${owner}/${payload.name}`;
           repos.set(repoKey(owner, repo.name), repo);
+          clearIssueJsonCache(repo); // rename changes the URLs in issue bodies
         }
         if (typeof payload.private === 'boolean') repo.private = payload.private;
         repo.updatedAt = nowIso();
@@ -1830,7 +1887,7 @@ async function restHandler(req, res, body) {
       const issue = repo.issueByNumber.get(number);
       if (!issue) return reply(404, { message: 'Not Found' });
       if (tail.length === 2) {
-        if (req.method === 'GET') return reply(200, issueJson(repo, issue, host));
+        if (req.method === 'GET') return sendJsonBody(res, 200, issueJsonBody(repo, issue, host));
         if (req.method === 'PATCH') {
           let payload;
           try { payload = parseJsonBody(body); } catch { return reply(400, { message: 'Problems parsing JSON' }); }
@@ -1847,6 +1904,7 @@ async function restHandler(req, res, body) {
             issue.labels = [...payload.labels];
           }
           issue.updatedAt = nowIso();
+          delete issue[ISSUE_JSON_CACHE];
           return reply(200, issueJson(repo, issue, host));
         }
         return reply(404, { message: 'Not Found' });
@@ -1864,6 +1922,7 @@ async function restHandler(req, res, body) {
           repo.comments.set(issue.number, list);
           commentsByNodeId.set(comment.nodeId, { repo, issue, comment });
           issue.updatedAt = nowIso();
+          delete issue[ISSUE_JSON_CACHE]; // comments count + updated_at changed
           return reply(201, commentJson(repo, issue, comment, host));
         }
         if (req.method === 'GET' && tail.length === 3) {
@@ -2905,25 +2964,30 @@ async function handleRequest(req, res) {
       res.writeHead(204, { 'X-GitHub-Request-Id': requestId() });
       return res.end();
     }
+    // Bodyless GET/HEAD requests never carry a body in this suite: skip the
+    // readBody promise and its extra event-loop turn. Anything that declares
+    // a body (content-length / chunked) still goes through readBody.
+    const method = req.method ?? 'GET';
+    const declaresBody = (req.headers['content-length'] !== undefined && req.headers['content-length'] !== '0')
+      || req.headers['transfer-encoding'] !== undefined;
+    const body = (method === 'GET' || method === 'HEAD') && !declaresBody
+      ? Buffer.alloc(0)
+      : await readBody(req);
     const gitMatch = pathname.match(/^\/([^/]+)\/([^/]+)\.git\/(.*)$/);
     if (gitMatch) {
       if (!authed(req)) return sendJson(res, 401, { message: 'Requires authentication' });
-      const body = await readBody(req);
       return gitHandler(req, res, decodeURIComponent(gitMatch[1]), decodeURIComponent(gitMatch[2]), gitMatch[3], body);
     }
     if (pathname === '/api/graphql') {
       if (!authed(req)) return sendJson(res, 401, { message: 'Requires authentication' });
-      const body = await readBody(req);
       return graphqlHandler(req, res, body);
     }
     if (pathname === '/mcp') {
       if (!authed(req)) return sendJson(res, 401, { message: 'Requires authentication' });
-      const body = await readBody(req);
       return mcpHandler(req, res, body);
     }
     if (pathname.startsWith('/api/v3')) {
       if (!authed(req)) return sendJson(res, 401, { message: 'Requires authentication' });
-      const body = await readBody(req);
       return restHandler(req, res, body);
     }
     return sendJson(res, 404, { message: 'Not Found' });
