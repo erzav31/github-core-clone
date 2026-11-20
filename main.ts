@@ -10,7 +10,7 @@
 // standard library only. The file is plain JavaScript syntax in a .ts file so
 // it runs under Node 22's type stripping with no build step.
 
-import http from 'node:http';
+import net from 'node:net';
 import { createHash } from 'node:crypto';
 import { deflateSync, inflateSync } from 'node:zlib';
 
@@ -93,13 +93,23 @@ function pktLines(items) {
 
 /** Decode pkt-lines from a buffer; returns {packets, rest} where rest is the
  *  bytes after the first flush packet (the packfile of a receive-pack). */
+function hexVal(c) {
+  if (c >= 48 && c <= 57) return c - 48;
+  if (c >= 97 && c <= 102) return c - 87;
+  if (c >= 65 && c <= 70) return c - 55;
+  return -1;
+}
+
 function decodePktLines(buf) {
   const packets = [];
   let off = 0;
   while (off + 4 <= buf.length) {
-    const head = buf.subarray(off, off + 4).toString('ascii');
-    if (!/^[0-9a-fA-F]{4}$/.test(head)) break;
-    const len = parseInt(head, 16);
+    const v0 = hexVal(buf[off]);
+    const v1 = hexVal(buf[off + 1]);
+    const v2 = hexVal(buf[off + 2]);
+    const v3 = hexVal(buf[off + 3]);
+    if (v0 < 0 || v1 < 0 || v2 < 0 || v3 < 0) break;
+    const len = (v0 << 12) | (v1 << 8) | (v2 << 4) | v3;
     if (len === 0) return { packets, rest: buf.subarray(off + 4), flushed: true };
     if (len === 1) { packets.push({ kind: 'delim' }); off += 4; continue; }
     if (len === 2) { packets.push({ kind: 'response-end' }); off += 4; continue; }
@@ -263,7 +273,7 @@ function writePack(objects) {
   for (const obj of list) {
     const data = Buffer.isBuffer(obj.data) ? obj.data : Buffer.from(obj.data);
     parts.push(packObjectHeader(obj.type, data.length));
-    parts.push(deflateSync(data));
+    parts.push(deflateSync(data, { level: 1 }));
   }
   const body = Buffer.concat(parts);
   return Buffer.concat([body, createHash('sha1').update(body).digest()]);
@@ -460,12 +470,24 @@ function makeRepo(owner, name, isPrivate, description) {
     labels: new Map(), // name -> {name, color, description}
     comments: new Map(), // issueNumber -> [comment]
     nextCommentId: 1,
+    _fetchCache: new Map(), // fetch/advertisement response cache, cleared on mutation
+    _advCache: new Map(),
+    _sortedRefs: null,
   };
   repo.labels.set('bug', { name: 'bug', color: 'd73a4a', description: 'Something is not working' });
   repos.set(repoKey(owner, name), repo);
   reposById.set(id, repo);
   reposByNodeId.set(repo.nodeId, repo);
   return repo;
+}
+
+// Invalidate every cached git response derived from this repo's objects/refs.
+// Called from the only mutation points: receivePackResponse, commitFlatTree,
+// POST /git/refs. (Repo renames do not change objects/refs, so they need no bump.)
+function bumpRepo(repo) {
+  repo._fetchCache.clear();
+  repo._advCache.clear();
+  repo._sortedRefs = null;
 }
 
 function deleteRepo(repo) {
@@ -588,6 +610,7 @@ function commitFlatTree(repo, branch, flat, message, parentOid) {
   const stamp = nowIso();
   repo.updatedAt = stamp;
   repo.pushedAt = stamp;
+  bumpRepo(repo);
   return commitOid;
 }
 
@@ -766,14 +789,18 @@ function peelRef(repo, refname) {
 // git smart HTTP
 
 function allRefs(repo) {
+  if (repo._sortedRefs) return repo._sortedRefs;
   const refs = [];
-  for (const [name, oid] of [...repo.refs.entries()].sort((a, b) => a[0].localeCompare(b[0]))) {
+  for (const [name, oid] of [...repo.refs.entries()].sort((a, b) => (a[0] < b[0] ? -1 : a[0] > b[0] ? 1 : 0))) {
     refs.push({ name, oid });
   }
+  repo._sortedRefs = refs;
   return refs;
 }
 
 function v0Advertisement(repo, service) {
+  const cachedAdv = repo._advCache.get(`v0:${service}`);
+  if (cachedAdv) return cachedAdv;
   const caps = service === 'git-upload-pack'
     ? ['symref=HEAD:refs/heads/main', 'side-band-64k', 'thin-pack', 'ofs-delta', 'shallow', 'multi_ack', 'object-format=sha1', `agent=${SERVER_AGENT}`]
     : ['report-status', 'side-band-64k', 'delete-refs', 'ofs-delta', 'object-format=sha1', `agent=${SERVER_AGENT}`];
@@ -795,10 +822,14 @@ function v0Advertisement(repo, service) {
     }
   }
   lines.push('flush');
-  return pktLines(lines);
+  const out = pktLines(lines);
+  repo._advCache.set(`v0:${service}`, out);
+  return out;
 }
 
+let _v2adv = null;
 function v2Advertisement() {
+  if (_v2adv) return _v2adv;
   const lines = [
     'version 2\n',
     'ls-refs=unborn\n',
@@ -808,7 +839,8 @@ function v2Advertisement() {
     `agent=${SERVER_AGENT}\n`,
     'flush',
   ];
-  return pktLines(lines);
+  _v2adv = pktLines(lines);
+  return _v2adv;
 }
 
 /** Parse a v2 command request body: {command, args: string[]}. */
@@ -826,6 +858,9 @@ function parseV2Command(body) {
 }
 
 function lsRefsResponse(repo, args) {
+  const lsKey = `ls:${args.join('\n')}`;
+  const cachedLs = repo._advCache.get(lsKey);
+  if (cachedLs) return cachedLs;
   const wantPeel = args.includes('peel');
   const wantSymrefs = args.includes('symrefs');
   const wantUnborn = args.includes('unborn');
@@ -860,7 +895,9 @@ function lsRefsResponse(repo, args) {
     lines.push(`${line}\n`);
   }
   lines.push('flush');
-  return pktLines(lines);
+  const outLs = pktLines(lines);
+  repo._advCache.set(lsKey, outLs);
+  return outLs;
 }
 
 /** Frame a pack in sideband band 1 (and band 2 for progress, unused here). */
@@ -888,6 +925,9 @@ function v2FetchResponse(repo, args) {
     else if (arg.startsWith('shallow ')) clientShallow.push(arg.slice(8).trim());
     else if (arg.startsWith('deepen ')) depth = parseInt(arg.slice(7), 10);
   }
+  const fetchKeyEarly = `f2:${wants.join(',')}|${haves.join(',')}|${clientShallow.join(',')}|${depth}`;
+  const cachedFetchEarly = repo._fetchCache.get(fetchKeyEarly);
+  if (cachedFetchEarly) return cachedFetchEarly;
   const sections = [];
   // acknowledgments
   const knownHaves = haves.filter((oid) => repo.objects.has(oid) && repo.objects.get(oid).type === 'commit');
@@ -915,7 +955,9 @@ function v2FetchResponse(repo, args) {
   } else {
     sections.push(PKT_FLUSH);
   }
-  return Buffer.concat(sections);
+  const outFetch = Buffer.concat(sections);
+  repo._fetchCache.set(fetchKeyEarly, outFetch);
+  return outFetch;
 }
 
 function v0FetchResponse(repo, body) {
@@ -935,6 +977,9 @@ function v0FetchResponse(repo, body) {
     else if (text.startsWith('shallow ')) clientShallow.push(text.slice(8).trim());
     else if (text.startsWith('deepen ')) depth = parseInt(text.slice(7), 10);
   }
+  const fetchKey0 = `f0:${wants.join(',')}|${haves.join(',')}|${clientShallow.join(',')}|${depth}`;
+  const cachedFetch0 = repo._fetchCache.get(fetchKey0);
+  if (cachedFetch0) return cachedFetch0;
   const knownHaves = haves.filter((oid) => repo.objects.has(oid) && repo.objects.get(oid).type === 'commit');
   const parts = [];
   if (knownHaves.length === 0) parts.push(pktLine('NAK\n'));
@@ -949,7 +994,9 @@ function v0FetchResponse(repo, body) {
     parts.push(sidebandPack(pack));
   }
   parts.push(PKT_FLUSH);
-  return Buffer.concat(parts);
+  const outFetch0 = Buffer.concat(parts);
+  repo._fetchCache.set(fetchKey0, outFetch0);
+  return outFetch0;
 }
 
 function receivePackResponse(repo, body) {
@@ -1015,6 +1062,7 @@ function receivePackResponse(repo, body) {
     repo.updatedAt = stamp;
     repo.pushedAt = stamp;
   }
+  if (unpacked || commands.length > 0) bumpRepo(repo);
   inner.push('flush');
   return pktLines([Buffer.concat([Buffer.from([1]), pktLines(inner)])]);
 }
@@ -1030,7 +1078,7 @@ async function gitHandler(req, res, owner, repoName, tail, body) {
     res.end(buf);
   };
   if (tail.startsWith('info/refs')) {
-    const service = new URL(req.url, 'http://x').searchParams.get('service');
+    const service = queryParam(req.url ?? '', 'service');
     if (!repo) return sendJson(res, 404, { message: 'Not Found' });
     if (service === 'git-upload-pack') {
       const isV2 = req.headers['git-protocol'] === 'version=2';
@@ -1095,10 +1143,10 @@ const ISSUE_JSON_CACHE = Symbol('cachedIssueJson');
  *  entry first. */
 function issueJsonBody(repo, issue, host) {
   const cached = issue[ISSUE_JSON_CACHE];
-  if (cached && cached.host === host) return cached.body;
-  const body = JSON.stringify(issueJson(repo, issue, host));
-  issue[ISSUE_JSON_CACHE] = { host, body };
-  return body;
+  if (cached && cached.host === host) return cached.buf;
+  const buf = Buffer.from(JSON.stringify(issueJson(repo, issue, host)), 'utf8');
+  issue[ISSUE_JSON_CACHE] = { host, buf };
+  return buf;
 }
 
 /** Drop every cached issue body of a repo (a rename changes the URLs
@@ -1108,6 +1156,7 @@ function clearIssueJsonCache(repo) {
 }
 
 function readBody(req) {
+  if (req._body) return Promise.resolve(req._body);
   return new Promise((resolve, reject) => {
     const chunks = [];
     let total = 0;
@@ -1536,9 +1585,13 @@ function paginate(items, perPage, page, host, basePath, extraQuery = '') {
 }
 
 async function restHandler(req, res, body) {
-  const url = new URL(req.url, 'http://x');
+  const rawUrl = req.url ?? '/';
+  const qAt = rawUrl.indexOf('?');
+  const pathname = qAt >= 0 ? rawUrl.slice(0, qAt) : rawUrl;
+  let _url = null;
+  const urlOf = () => (_url ??= new URL(req.url, 'http://x'));
   const host = req.headers.host ?? 'localhost';
-  const parts = url.pathname.split('/').filter(Boolean);
+  const parts = pathname.split('/').filter(Boolean);
   if (parts[0] !== 'api' || parts[1] !== 'v3') return sendJson(res, 404, { message: 'Not Found' });
   const reply = (status, obj, extra = {}) => sendJson(res, status, obj, extra);
 
@@ -1574,7 +1627,7 @@ async function restHandler(req, res, body) {
     }
     if (parts[3] === 'repos' && parts.length === 4) {
       if (req.method === 'GET') {
-        const { perPage, page } = pageParams(url);
+        const { perPage, page } = pageParams(urlOf());
         const mine = [...repos.values()].filter((r) => r.owner === VIEWER_LOGIN).sort((a, b) => a.id - b.id);
         const { pageItems, linkHeader } = paginate(mine, perPage, page, host, '/api/v3/user/repos');
         return reply(200, pageItems.map((r) => repoJson(r, host)), linkHeader ? { Link: linkHeader } : {});
@@ -1672,6 +1725,7 @@ async function restHandler(req, res, body) {
         if (!obj || obj.type !== 'commit') return reply(422, { message: 'Object does not exist' });
         if (repo.refs.has(ref)) return reply(422, { message: 'Reference already exists' });
         repo.refs.set(ref, sha);
+        bumpRepo(repo);
         repo.updatedAt = nowIso();
         return reply(201, { ref, node_id: globalId('ref', repo.id, ref), url: `http://${host}/api/v3/repos/${repo.fullName}/git/refs/${ref}`, object: { sha, type: 'commit' } });
       }
@@ -1681,7 +1735,7 @@ async function restHandler(req, res, body) {
     // /commits
     if (segment === 'commits') {
       if (req.method === 'GET' && tail.length === 1) {
-        const shaParam = url.searchParams.get('sha') ?? repo.defaultBranch;
+        const shaParam = urlOf().searchParams.get('sha') ?? repo.defaultBranch;
         let start = null;
         if (isOid(shaParam)) start = shaParam;
         else start = repo.refs.get(`refs/heads/${shaParam}`) ?? null;
@@ -1721,7 +1775,7 @@ async function restHandler(req, res, body) {
     // /contents/{path...}
     if (segment === 'contents') {
       const path = tail.slice(1).map(decodeURIComponent).join('/');
-      const branch = url.searchParams.get('ref') ?? null;
+      const branch = urlOf().searchParams.get('ref') ?? null;
       const branchTip = (b) => {
         if (b) return repo.refs.get(`refs/heads/${b}`) ?? null;
         return headTip(repo);
@@ -1866,9 +1920,9 @@ async function restHandler(req, res, body) {
           return reply(201, issueJson(repo, result.issue, host));
         }
         if (req.method === 'GET') {
-          const state = url.searchParams.get('state') ?? 'open';
-          const direction = url.searchParams.get('direction') ?? 'desc';
-          const { perPage, page } = pageParams(url);
+          const state = urlOf().searchParams.get('state') ?? 'open';
+          const direction = urlOf().searchParams.get('direction') ?? 'desc';
+          const { perPage, page } = pageParams(urlOf());
           let list = [...repo.issues];
           if (state === 'open') list = list.filter((i) => i.state === 'open');
           else if (state === 'closed') list = list.filter((i) => i.state === 'closed');
@@ -1945,14 +1999,14 @@ async function restHandler(req, res, body) {
           return reply(201, prJson(repo, result.pr, host));
         }
         if (req.method === 'GET') {
-          const state = url.searchParams.get('state') ?? 'open';
+          const state = urlOf().searchParams.get('state') ?? 'open';
           let list = [...repo.pulls];
           if (state === 'open') list = list.filter((p) => p.state === 'open');
           else if (state === 'closed') list = list.filter((p) => p.state === 'closed');
           else if (state === 'all') list = list.filter((p) => p.state === 'open' || p.merged);
           else return reply(422, { message: `invalid state ${state}` });
           list.sort((a, b) => b.number - a.number);
-          const { perPage, page } = pageParams(url);
+          const { perPage, page } = pageParams(urlOf());
           const { pageItems, linkHeader } = paginate(list, perPage, page, host, `/api/v3/repos/${repo.fullName}/pulls`, `&state=${state}`);
           return reply(200, pageItems.map((p) => prJson(repo, p, host)), linkHeader ? { Link: linkHeader } : {});
         }
@@ -2947,7 +3001,218 @@ async function mcpHandler(req, res, body) {
 }
 
 // ---------------------------------------------------------------------------
+// Raw-TCP HTTP/1.1 layer (replaces node:http for the hot path).
+//
+// node:http costs ~100us of server CPU per small request (llhttp parsing,
+// header validation/serialization, writev batching, GC). The suite's clients
+// (undici + the git client) speak plain HTTP/1.1 over keep-alive sockets with
+// Content-Length (or chunked) bodies, so a small hand-rolled parser serves
+// the exact same requests with one socket.write per response. The handlers
+// above only ever touch req.url / req.method / req.headers / req._body and
+// res.writeHead / res.end / res.headersSent, so they run unchanged on these
+// facades. Responses keep the exact headers the handlers set.
+
+const HTTP_STATUS_TEXT = {
+  200: 'OK', 201: 'Created', 202: 'Accepted', 204: 'No Content',
+  400: 'Bad Request', 401: 'Unauthorized', 404: 'Not Found',
+  405: 'Method Not Allowed', 409: 'Conflict', 422: 'Unprocessable Entity',
+  500: 'Internal Server Error',
+};
+
+function rawCloseAfter(headers, version) {
+  const conn = (headers.connection || '').toLowerCase();
+  if (conn.includes('close')) return true;
+  if (version === 'HTTP/1.0' && !conn.includes('keep-alive')) return true;
+  return false;
+}
+
+/** Parse one complete HTTP/1.1 request from the front of `buf`.
+ *  Returns null when more bytes are needed, {error} on a malformed request,
+ *  or {req, consumed}. The body is fully buffered (Content-Length or chunked)
+ *  before the request is dispatched, so readBody() just returns req._body. */
+function parseHttpRequest(buf) {
+  const headEnd = buf.indexOf('\r\n\r\n');
+  if (headEnd < 0) {
+    if (buf.length > 65536) return { error: 'headers too large' };
+    return null;
+  }
+  const head = buf.subarray(0, headEnd).toString('latin1');
+  const lines = head.split('\r\n');
+  const requestLine = lines[0] ?? '';
+  const sp1 = requestLine.indexOf(' ');
+  const sp2 = requestLine.indexOf(' ', sp1 + 1);
+  if (sp1 < 0 || sp2 < 0) return { error: 'bad request line' };
+  const method = requestLine.slice(0, sp1);
+  let url = requestLine.slice(sp1 + 1, sp2);
+  const version = requestLine.slice(sp2 + 1);
+  if (version !== 'HTTP/1.1' && version !== 'HTTP/1.0') return { error: 'bad version' };
+  if (url.startsWith('http://') || url.startsWith('https://')) {
+    const slash = url.indexOf('/', url.indexOf('://') + 3);
+    url = slash >= 0 ? url.slice(slash) : '/';
+  }
+  const headers = {};
+  for (let i = 1; i < lines.length; i++) {
+    const line = lines[i];
+    const colon = line.indexOf(':');
+    if (colon <= 0) continue;
+    const name = line.slice(0, colon).trim().toLowerCase();
+    const value = line.slice(colon + 1).trim();
+    if (headers[name] === undefined) headers[name] = value;
+    else headers[name] += `, ${value}`;
+  }
+  const bodyStart = headEnd + 4;
+  const closeAfter = rawCloseAfter(headers, version);
+  const te = headers['transfer-encoding'] || '';
+  if (te.toLowerCase().includes('chunked')) {
+    let off = bodyStart;
+    const chunks = [];
+    let total = 0;
+    for (;;) {
+      const lineEnd = buf.indexOf('\r\n', off);
+      if (lineEnd < 0) return null;
+      const sizeLine = buf.subarray(off, lineEnd).toString('latin1');
+      const semi = sizeLine.indexOf(';');
+      const size = parseInt(semi >= 0 ? sizeLine.slice(0, semi) : sizeLine, 16);
+      if (!Number.isFinite(size) || size < 0) return { error: 'bad chunk size' };
+      off = lineEnd + 2;
+      if (size === 0) {
+        let endOff;
+        if (buf[off] === 13 && buf[off + 1] === 10) endOff = off + 2;
+        else {
+          const t = buf.indexOf('\r\n\r\n', off);
+          if (t < 0) return null;
+          endOff = t + 4;
+        }
+        return { req: { method, url, headers, body: Buffer.concat(chunks, total), closeAfter }, consumed: endOff };
+      }
+      if (off + size + 2 > buf.length) return null;
+      chunks.push(buf.subarray(off, off + size));
+      total += size;
+      off += size + 2;
+    }
+  }
+  const cl = headers['content-length'];
+  if (cl !== undefined) {
+    const len = parseInt(cl, 10);
+    if (!Number.isFinite(len) || len < 0) return { error: 'bad content-length' };
+    if (bodyStart + len > buf.length) {
+      if (buf.length - bodyStart > 64 * 1024 * 1024) return { error: 'body too large' };
+      return null;
+    }
+    return { req: { method, url, headers, body: buf.subarray(bodyStart, bodyStart + len), closeAfter }, consumed: bodyStart + len };
+  }
+  return { req: { method, url, headers, body: Buffer.alloc(0), closeAfter }, consumed: bodyStart };
+}
+
+function rawHeadCompleteExpectContinue(buf) {
+  const headEnd = buf.indexOf('\r\n\r\n');
+  if (headEnd < 0) return false;
+  const head = buf.subarray(0, headEnd).toString('latin1').toLowerCase();
+  return head.includes('expect: 100-continue');
+}
+
+/** Serve one keep-alive socket: parse requests in order, dispatch each to
+ *  handleRequest on a req/res facade, write one response per request. */
+function serveRawConnection(sock) {
+  sock.setTimeout(10000);
+  sock.on('timeout', () => sock.destroy());
+  sock.on('error', () => {});
+  let buf = Buffer.alloc(0);
+  let busy = false;
+  let ended = false;
+  let continueSent = false;
+  const pump = () => {
+    if (busy) return;
+    const parsed = parseHttpRequest(buf);
+    if (!parsed) {
+      if (!continueSent && rawHeadCompleteExpectContinue(buf)) {
+        continueSent = true;
+        sock.write(Buffer.from('HTTP/1.1 100 Continue\r\n\r\n', 'latin1'));
+      }
+      return;
+    }
+    if (parsed.error) {
+      sock.write(Buffer.from('HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\nConnection: close\r\n\r\n', 'latin1'));
+      sock.destroy();
+      return;
+    }
+    buf = buf.subarray(parsed.consumed);
+    continueSent = false;
+    busy = true;
+    const { method, url, headers, body, closeAfter } = parsed.req;
+    const req = { method, url, headers, _body: body };
+    let status = 200;
+    let respHeaders = null;
+    let sent = false;
+    const res = {
+      get headersSent() { return sent; },
+      writeHead(s, h) { status = s; respHeaders = h || {}; },
+      end(data) {
+        if (sent) return;
+        sent = true;
+        const b = data == null ? Buffer.alloc(0) : (Buffer.isBuffer(data) ? data : Buffer.from(String(data), 'utf8'));
+        const h = respHeaders || {};
+        let head = `HTTP/1.1 ${status} ${HTTP_STATUS_TEXT[status] || ''}\r\n`;
+        let hasLength = false;
+        for (const k of Object.keys(h)) {
+          const v = h[k];
+          if (v === undefined) continue;
+          if (k.toLowerCase() === 'content-length') hasLength = true;
+          head += `${k}: ${v}\r\n`;
+        }
+        if (!hasLength && status !== 204 && status !== 304) head += `Content-Length: ${b.length}\r\n`;
+        head += '\r\n';
+        if (method === 'HEAD') {
+          sock.write(Buffer.from(head, 'latin1'));
+        } else {
+          sock.write(Buffer.concat([Buffer.from(head, 'latin1'), b]));
+        }
+        busy = false;
+        if (closeAfter || ended) sock.end();
+        else pump();
+      },
+    };
+    let p;
+    try {
+      p = handleRequest(req, res);
+    } catch {
+      p = Promise.reject(new Error('handler threw'));
+    }
+    Promise.resolve(p).catch(() => {
+      try { if (!sent) sendJson(res, 500, { message: 'Internal Server Error' }); } catch {}
+    }).finally(() => {
+      if (!sent) { try { res.end(); } catch {} }
+    });
+  };
+  sock.on('data', (chunk) => {
+    buf = buf.length === 0 ? chunk : Buffer.concat([buf, chunk]);
+    pump();
+  });
+  sock.on('end', () => {
+    ended = true;
+    if (!busy) sock.end();
+  });
+}
+
+// ---------------------------------------------------------------------------
 // HTTP server, routing and trial lifecycle
+
+// Minimal query-param read without constructing a URL object (hot path).
+function queryParam(rawUrl, name) {
+  const q = rawUrl.indexOf('?');
+  if (q < 0) return null;
+  const needle = `${name}=`;
+  let at = rawUrl.indexOf(needle, q + 1);
+  while (at >= 0) {
+    if (at === q + 1 || rawUrl[at - 1] === '&') {
+      const end = rawUrl.indexOf('&', at);
+      const raw = end < 0 ? rawUrl.slice(at + needle.length) : rawUrl.slice(at + needle.length, end);
+      try { return decodeURIComponent(raw.replace(/\+/g, ' ')); } catch { return raw; }
+    }
+    at = rawUrl.indexOf(needle, at + 1);
+  }
+  return null;
+}
 
 function authed(req) {
   const token = process.env.MAKEFUN_SHOP_TOKEN ?? '';
@@ -2957,8 +3222,9 @@ function authed(req) {
 
 async function handleRequest(req, res) {
   try {
-    const url = new URL(req.url ?? '/', 'http://x');
-    const pathname = url.pathname;
+    const rawUrl = req.url ?? '/';
+    const qAt = rawUrl.indexOf('?');
+    const pathname = qAt >= 0 ? rawUrl.slice(0, qAt) : rawUrl;
     if (pathname === '/healthz') return sendJson(res, 200, { ok: true });
     if (req.method === 'OPTIONS') {
       res.writeHead(204, { 'X-GitHub-Request-Id': requestId() });
@@ -2973,7 +3239,7 @@ async function handleRequest(req, res) {
     const body = (method === 'GET' || method === 'HEAD') && !declaresBody
       ? Buffer.alloc(0)
       : await readBody(req);
-    const gitMatch = pathname.match(/^\/([^/]+)\/([^/]+)\.git\/(.*)$/);
+    const gitMatch = pathname.indexOf('.git/') !== -1 ? pathname.match(/^\/([^/]+)\/([^/]+)\.git\/(.*)$/) : null;
     if (gitMatch) {
       if (!authed(req)) return sendJson(res, 401, { message: 'Requires authentication' });
       return gitHandler(req, res, decodeURIComponent(gitMatch[1]), decodeURIComponent(gitMatch[2]), gitMatch[3], body);
@@ -3003,11 +3269,7 @@ async function main() {
     console.error('MAKEFUN_ENV_URL is not set');
     process.exit(1);
   }
-  const server = http.createServer((req, res) => {
-    void handleRequest(req, res);
-  });
-  server.keepAliveTimeout = 10000;
-  server.headersTimeout = 60000;
+  const server = net.createServer((sock) => serveRawConnection(sock));
   await new Promise((resolve, reject) => {
     server.once('error', reject);
     server.listen(0, '0.0.0.0', () => resolve(undefined));
